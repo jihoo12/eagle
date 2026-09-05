@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # Keep the kernel's formatting gate independent of the intentionally
+      # empty CLI entry point while Milestone 8 has not started.
+      - run: rustfmt --check src/lib.rs
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets

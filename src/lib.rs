@@ -1,0 +1,1064 @@
+//! Eagle's deliberately small MLTT kernel.
+//!
+//! Syntax uses de Bruijn *indices*; semantic neutrals use de Bruijn *levels*.
+//! Both syntax and semantic values are `Rc` allocated. See
+//! `docs/core-language.md` for the current core-language contract and
+//! `docs/cubical-extension.md` for the separate dimension-context plan.
+
+use std::fmt;
+use std::rc::Rc;
+
+pub type Term = Rc<Expr>;
+pub type Value = Rc<Val>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Expr {
+    Var(usize),
+    Universe(u32),
+    Pi { domain: Term, codomain: Term },
+    Lam(Term),
+    App { function: Term, argument: Term },
+    Sigma { first: Term, second: Term },
+    Pair { first: Term, second: Term },
+    Fst(Term),
+    Snd(Term),
+    Nat,
+    Zero,
+    Succ(Term),
+}
+
+pub fn var(index: usize) -> Term {
+    Rc::new(Expr::Var(index))
+}
+pub fn universe(level: u32) -> Term {
+    Rc::new(Expr::Universe(level))
+}
+pub fn pi(domain: Term, codomain: Term) -> Term {
+    Rc::new(Expr::Pi { domain, codomain })
+}
+pub fn lam(body: Term) -> Term {
+    Rc::new(Expr::Lam(body))
+}
+pub fn app(function: Term, argument: Term) -> Term {
+    Rc::new(Expr::App { function, argument })
+}
+pub fn sigma(first: Term, second: Term) -> Term {
+    Rc::new(Expr::Sigma { first, second })
+}
+pub fn pair(first: Term, second: Term) -> Term {
+    Rc::new(Expr::Pair { first, second })
+}
+pub fn nat() -> Term {
+    Rc::new(Expr::Nat)
+}
+pub fn zero() -> Term {
+    Rc::new(Expr::Zero)
+}
+pub fn succ(term: Term) -> Term {
+    Rc::new(Expr::Succ(term))
+}
+
+/// A binder in an inductive declaration.  Parameters are fixed for every
+/// constructor/result; indices may vary and are the inputs to elimination.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Binder {
+    pub name: String,
+    pub ty: Term,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConstructorDecl {
+    pub name: String,
+    pub fields: Vec<Binder>,
+    /// The result's index arguments, one for each `InductiveDecl::indices`.
+    pub result_indices: Vec<Term>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InductiveDecl {
+    pub name: String,
+    pub params: Vec<Binder>,
+    pub indices: Vec<Binder>,
+    pub universe: u32,
+    pub constructors: Vec<ConstructorDecl>,
+}
+
+impl InductiveDecl {
+    /// Structural validation owned by the trusted declaration boundary.  Full
+    /// positivity and constructor type checking belong to the next kernel step.
+    pub fn validate_shape(&self) -> Result<(), KernelError> {
+        if self.constructors.is_empty() {
+            return Err(KernelError::InvalidInductive(
+                "an inductive needs a constructor",
+            ));
+        }
+        if self
+            .params
+            .iter()
+            .chain(&self.indices)
+            .any(|b| b.name.is_empty())
+        {
+            return Err(KernelError::InvalidInductive("binders need names"));
+        }
+        if self
+            .constructors
+            .iter()
+            .any(|c| c.result_indices.len() != self.indices.len())
+        {
+            return Err(KernelError::InvalidInductive(
+                "constructor result has the wrong number of indices",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub enum Val {
+    Universe(u32),
+    Pi(Value, Closure),
+    Sigma(Value, Closure),
+    Lam(Closure),
+    Nat,
+    Zero,
+    Succ(Value),
+    Pair(Value, Value),
+    Neutral(Neutral),
+}
+
+impl fmt::Debug for Val {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Universe(n) => write!(f, "Type({n})"),
+            Self::Pi(..) => write!(f, "Pi(..)"),
+            Self::Sigma(..) => write!(f, "Sigma(..)"),
+            Self::Lam(..) => write!(f, "Lam(..)"),
+            Self::Nat => write!(f, "Nat"),
+            Self::Zero => write!(f, "zero"),
+            Self::Succ(v) => f.debug_tuple("succ").field(v).finish(),
+            Self::Pair(a, b) => f.debug_tuple("pair").field(a).field(b).finish(),
+            Self::Neutral(n) => n.fmt(f),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Closure {
+    env: Env,
+    body: Term,
+}
+
+/// A persistent environment. `extend` allocates one node and shares its tail;
+/// closure capture is therefore an O(1) clone of the environment handle.
+#[derive(Clone, Debug, Default)]
+struct Env {
+    head: Option<Rc<EnvNode>>,
+    len: usize,
+}
+#[derive(Debug)]
+struct EnvNode {
+    value: Value,
+    previous: Option<Rc<EnvNode>>,
+}
+impl Env {
+    fn extend(&self, value: Value) -> Self {
+        Self {
+            head: Some(Rc::new(EnvNode {
+                value,
+                previous: self.head.clone(),
+            })),
+            len: self.len + 1,
+        }
+    }
+    /// De Bruijn index lookup: zero denotes the most recent binder.
+    fn get(&self, index: usize) -> Option<Value> {
+        let mut node = self.head.as_ref()?;
+        for _ in 0..index {
+            node = node.previous.as_ref()?;
+        }
+        Some(node.value.clone())
+    }
+}
+#[derive(Clone, Debug)]
+pub enum Neutral {
+    Var(usize),
+    App(Rc<Neutral>, Value),
+    Fst(Rc<Neutral>),
+    Snd(Rc<Neutral>),
+}
+
+// `Rc` only avoids recursive destruction when a shared tail remains.  These
+// destructors drain uniquely-owned chains explicitly, keeping normal teardown
+// of stress-sized syntax, values, and environments off the native stack.
+impl Drop for EnvNode {
+    fn drop(&mut self) {
+        let mut next = self.previous.take();
+        while let Some(node) = next {
+            match Rc::try_unwrap(node) {
+                Ok(mut node) => next = node.previous.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+fn take_expr_children(expr: &mut Expr, work: &mut Vec<Term>) {
+    let empty = || Rc::new(Expr::Zero);
+    match expr {
+        Expr::Pi { domain, codomain }
+        | Expr::Sigma {
+            first: domain,
+            second: codomain,
+        } => {
+            work.push(std::mem::replace(domain, empty()));
+            work.push(std::mem::replace(codomain, empty()));
+        }
+        Expr::Lam(body) | Expr::Fst(body) | Expr::Snd(body) | Expr::Succ(body) => {
+            work.push(std::mem::replace(body, empty()))
+        }
+        Expr::App { function, argument }
+        | Expr::Pair {
+            first: function,
+            second: argument,
+        } => {
+            work.push(std::mem::replace(function, empty()));
+            work.push(std::mem::replace(argument, empty()));
+        }
+        Expr::Var(_) | Expr::Universe(_) | Expr::Nat | Expr::Zero => {}
+    }
+}
+impl Drop for Expr {
+    fn drop(&mut self) {
+        let mut work = Vec::new();
+        take_expr_children(self, &mut work);
+        while let Some(node) = work.pop() {
+            if let Ok(mut node) = Rc::try_unwrap(node) {
+                take_expr_children(&mut node, &mut work);
+            }
+        }
+    }
+}
+fn take_val_children(value: &mut Val, work: &mut Vec<Value>) {
+    match value {
+        Val::Pi(domain, closure) | Val::Sigma(domain, closure) => {
+            work.push(std::mem::replace(domain, Rc::new(Val::Zero)));
+            closure.env = Env::default();
+            let body = std::mem::replace(&mut closure.body, zero());
+            drop(body);
+        }
+        Val::Lam(closure) => {
+            closure.env = Env::default();
+            let body = std::mem::replace(&mut closure.body, zero());
+            drop(body);
+        }
+        Val::Succ(inner) => work.push(std::mem::replace(inner, Rc::new(Val::Zero))),
+        Val::Pair(a, b) => {
+            work.push(std::mem::replace(a, Rc::new(Val::Zero)));
+            work.push(std::mem::replace(b, Rc::new(Val::Zero)));
+        }
+        Val::Universe(_) | Val::Nat | Val::Zero | Val::Neutral(_) => {}
+    }
+}
+impl Drop for Val {
+    fn drop(&mut self) {
+        let mut work = Vec::new();
+        take_val_children(self, &mut work);
+        while let Some(node) = work.pop() {
+            if let Ok(mut node) = Rc::try_unwrap(node) {
+                take_val_children(&mut node, &mut work);
+            }
+        }
+    }
+}
+fn take_neutral_head(neutral: &mut Neutral) -> Option<Rc<Neutral>> {
+    match neutral {
+        Neutral::Var(_) => None,
+        Neutral::App(head, argument) => {
+            drop(std::mem::replace(argument, Rc::new(Val::Zero)));
+            Some(std::mem::replace(head, Rc::new(Neutral::Var(0))))
+        }
+        Neutral::Fst(head) | Neutral::Snd(head) => {
+            Some(std::mem::replace(head, Rc::new(Neutral::Var(0))))
+        }
+    }
+}
+impl Drop for Neutral {
+    fn drop(&mut self) {
+        let mut next = take_neutral_head(self);
+        while let Some(node) = next {
+            match Rc::try_unwrap(node) {
+                Ok(mut node) => next = take_neutral_head(&mut node),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KernelError {
+    UnboundVariable(usize),
+    ExpectedFunction,
+    ExpectedPair,
+    ExpectedType,
+    TypeMismatch { expected: Term, found: Term },
+    CannotInferLambda,
+    OutOfFuel,
+    InvalidInductive(&'static str),
+}
+
+/// Evaluation uses a heap-allocated CEK-style work stack and explicit fuel.
+/// Well-typed MLTT terms normalize; fuel makes the remaining CPU policy explicit.
+#[derive(Clone, Copy, Debug)]
+pub struct EvalConfig {
+    pub fuel: usize,
+}
+impl Default for EvalConfig {
+    fn default() -> Self {
+        Self { fuel: 100_000 }
+    }
+}
+
+struct Evaluator {
+    remaining: usize,
+}
+enum EvalFrame {
+    AppArgument { argument: Term, env: Env },
+    Apply(Value),
+    Pi { codomain: Term, env: Env },
+    Sigma { second: Term, env: Env },
+    PairSecond { second: Term, env: Env },
+    MakePair(Value),
+    Fst,
+    Snd,
+    Succ,
+}
+impl Evaluator {
+    fn tick(&mut self) -> Result<(), KernelError> {
+        if self.remaining == 0 {
+            Err(KernelError::OutOfFuel)
+        } else {
+            self.remaining -= 1;
+            Ok(())
+        }
+    }
+    fn eval(&mut self, term: &Term, env: &Env) -> Result<Value, KernelError> {
+        // A CEK-like heap work stack keeps arbitrary term nesting off the native stack.
+        let mut current = Some((term.clone(), env.clone()));
+        let mut value = None;
+        let mut frames = Vec::new();
+        loop {
+            if let Some((term, env)) = current.take() {
+                self.tick()?;
+                match term.as_ref() {
+                    Expr::Var(i) => {
+                        value = Some(env.get(*i).ok_or(KernelError::UnboundVariable(*i))?)
+                    }
+                    Expr::Universe(i) => value = Some(Rc::new(Val::Universe(*i))),
+                    Expr::Lam(body) => {
+                        value = Some(Rc::new(Val::Lam(Closure {
+                            env,
+                            body: body.clone(),
+                        })))
+                    }
+                    Expr::Nat => value = Some(Rc::new(Val::Nat)),
+                    Expr::Zero => value = Some(Rc::new(Val::Zero)),
+                    Expr::Pi { domain, codomain } => {
+                        frames.push(EvalFrame::Pi {
+                            codomain: codomain.clone(),
+                            env: env.clone(),
+                        });
+                        current = Some((domain.clone(), env));
+                    }
+                    Expr::Sigma { first, second } => {
+                        frames.push(EvalFrame::Sigma {
+                            second: second.clone(),
+                            env: env.clone(),
+                        });
+                        current = Some((first.clone(), env));
+                    }
+                    Expr::App { function, argument } => {
+                        frames.push(EvalFrame::AppArgument {
+                            argument: argument.clone(),
+                            env: env.clone(),
+                        });
+                        current = Some((function.clone(), env));
+                    }
+                    Expr::Pair { first, second } => {
+                        frames.push(EvalFrame::PairSecond {
+                            second: second.clone(),
+                            env: env.clone(),
+                        });
+                        current = Some((first.clone(), env));
+                    }
+                    Expr::Fst(pair) => {
+                        frames.push(EvalFrame::Fst);
+                        current = Some((pair.clone(), env));
+                    }
+                    Expr::Snd(pair) => {
+                        frames.push(EvalFrame::Snd);
+                        current = Some((pair.clone(), env));
+                    }
+                    Expr::Succ(inner) => {
+                        frames.push(EvalFrame::Succ);
+                        current = Some((inner.clone(), env));
+                    }
+                }
+                continue;
+            }
+            let result = value.take().expect("machine has a value after a term");
+            match frames.pop() {
+                None => return Ok(result),
+                Some(EvalFrame::AppArgument { argument, env }) => {
+                    frames.push(EvalFrame::Apply(result));
+                    current = Some((argument, env));
+                }
+                Some(EvalFrame::Apply(function)) => match function.as_ref() {
+                    Val::Lam(closure) | Val::Pi(_, closure) => {
+                        current = Some((closure.body.clone(), closure.env.extend(result)))
+                    }
+                    Val::Neutral(neutral) => {
+                        value = Some(Rc::new(Val::Neutral(Neutral::App(
+                            Rc::new(neutral.clone()),
+                            result,
+                        ))))
+                    }
+                    _ => return Err(KernelError::ExpectedFunction),
+                },
+                Some(EvalFrame::Pi { codomain, env }) => {
+                    value = Some(Rc::new(Val::Pi(
+                        result,
+                        Closure {
+                            env,
+                            body: codomain,
+                        },
+                    )))
+                }
+                Some(EvalFrame::Sigma { second, env }) => {
+                    value = Some(Rc::new(Val::Sigma(result, Closure { env, body: second })))
+                }
+                Some(EvalFrame::PairSecond { second, env }) => {
+                    frames.push(EvalFrame::MakePair(result));
+                    current = Some((second, env));
+                }
+                Some(EvalFrame::MakePair(first)) => value = Some(Rc::new(Val::Pair(first, result))),
+                Some(EvalFrame::Fst) => value = Some(self.fst(result)?),
+                Some(EvalFrame::Snd) => value = Some(self.snd(result)?),
+                Some(EvalFrame::Succ) => value = Some(Rc::new(Val::Succ(result))),
+            }
+        }
+    }
+    fn close(&mut self, c: &Closure, arg: Value) -> Result<Value, KernelError> {
+        self.eval(&c.body, &c.env.extend(arg))
+    }
+    fn fst(&mut self, value: Value) -> Result<Value, KernelError> {
+        match value.as_ref() {
+            Val::Pair(a, _) => Ok(a.clone()),
+            Val::Neutral(n) => Ok(Rc::new(Val::Neutral(Neutral::Fst(Rc::new(n.clone()))))),
+            _ => Err(KernelError::ExpectedPair),
+        }
+    }
+    fn snd(&mut self, value: Value) -> Result<Value, KernelError> {
+        match value.as_ref() {
+            Val::Pair(_, b) => Ok(b.clone()),
+            Val::Neutral(n) => Ok(Rc::new(Val::Neutral(Neutral::Snd(Rc::new(n.clone()))))),
+            _ => Err(KernelError::ExpectedPair),
+        }
+    }
+}
+
+pub fn eval(term: &Term, config: EvalConfig) -> Result<Value, KernelError> {
+    Evaluator {
+        remaining: config.fuel,
+    }
+    .eval(term, &Env::default())
+}
+
+enum QuoteTask {
+    Value(Value, usize),
+    Neutral(Rc<Neutral>, usize),
+}
+enum QuoteFrame {
+    PiBody { closure: Closure, level: usize },
+    SigmaBody { closure: Closure, level: usize },
+    MakePi(Term),
+    MakeSigma(Term),
+    MakeLam,
+    PairSecond { second: Value, level: usize },
+    MakePair(Term),
+    MakeSucc,
+    NeutralAppArgument { argument: Value, level: usize },
+    MakeApp(Term),
+    MakeFst,
+    MakeSnd,
+}
+
+/// Reification is an explicit heap machine, parallel to `Evaluator`; it never
+/// uses one Rust frame per value/neutral constructor.
+fn quote_task(initial: QuoteTask, config: EvalConfig) -> Result<Term, KernelError> {
+    let mut task = Some(initial);
+    let mut result = None;
+    let mut frames = Vec::new();
+    let mut ev = Evaluator {
+        remaining: config.fuel,
+    };
+    loop {
+        if let Some(task_now) = task.take() {
+            match task_now {
+                QuoteTask::Value(value, level) => match value.as_ref() {
+                    Val::Universe(i) => result = Some(universe(*i)),
+                    Val::Nat => result = Some(nat()),
+                    Val::Zero => result = Some(zero()),
+                    Val::Succ(inner) => {
+                        frames.push(QuoteFrame::MakeSucc);
+                        task = Some(QuoteTask::Value(inner.clone(), level));
+                    }
+                    Val::Pi(domain, closure) => {
+                        frames.push(QuoteFrame::PiBody {
+                            closure: closure.clone(),
+                            level,
+                        });
+                        task = Some(QuoteTask::Value(domain.clone(), level));
+                    }
+                    Val::Sigma(first, closure) => {
+                        frames.push(QuoteFrame::SigmaBody {
+                            closure: closure.clone(),
+                            level,
+                        });
+                        task = Some(QuoteTask::Value(first.clone(), level));
+                    }
+                    Val::Lam(closure) => {
+                        let x = Rc::new(Val::Neutral(Neutral::Var(level)));
+                        frames.push(QuoteFrame::MakeLam);
+                        task = Some(QuoteTask::Value(ev.close(closure, x)?, level + 1));
+                    }
+                    Val::Pair(first, second) => {
+                        frames.push(QuoteFrame::PairSecond {
+                            second: second.clone(),
+                            level,
+                        });
+                        task = Some(QuoteTask::Value(first.clone(), level));
+                    }
+                    Val::Neutral(neutral) => {
+                        task = Some(QuoteTask::Neutral(Rc::new(neutral.clone()), level))
+                    }
+                },
+                QuoteTask::Neutral(neutral, level) => match neutral.as_ref() {
+                    Neutral::Var(l) => {
+                        result = Some(var(level
+                            .checked_sub(*l + 1)
+                            .ok_or(KernelError::UnboundVariable(*l))?))
+                    }
+                    Neutral::App(function, argument) => {
+                        frames.push(QuoteFrame::NeutralAppArgument {
+                            argument: argument.clone(),
+                            level,
+                        });
+                        task = Some(QuoteTask::Neutral(function.clone(), level));
+                    }
+                    Neutral::Fst(pair) => {
+                        frames.push(QuoteFrame::MakeFst);
+                        task = Some(QuoteTask::Neutral(pair.clone(), level));
+                    }
+                    Neutral::Snd(pair) => {
+                        frames.push(QuoteFrame::MakeSnd);
+                        task = Some(QuoteTask::Neutral(pair.clone(), level));
+                    }
+                },
+            }
+            continue;
+        }
+        let term = result
+            .take()
+            .expect("quote machine has a term after a task");
+        match frames.pop() {
+            None => return Ok(term),
+            Some(QuoteFrame::PiBody { closure, level }) => {
+                let x = Rc::new(Val::Neutral(Neutral::Var(level)));
+                frames.push(QuoteFrame::MakePi(term));
+                task = Some(QuoteTask::Value(ev.close(&closure, x)?, level + 1));
+            }
+            Some(QuoteFrame::SigmaBody { closure, level }) => {
+                let x = Rc::new(Val::Neutral(Neutral::Var(level)));
+                frames.push(QuoteFrame::MakeSigma(term));
+                task = Some(QuoteTask::Value(ev.close(&closure, x)?, level + 1));
+            }
+            Some(QuoteFrame::MakePi(domain)) => result = Some(pi(domain, term)),
+            Some(QuoteFrame::MakeSigma(first)) => result = Some(sigma(first, term)),
+            Some(QuoteFrame::MakeLam) => result = Some(lam(term)),
+            Some(QuoteFrame::PairSecond { second, level }) => {
+                frames.push(QuoteFrame::MakePair(term));
+                task = Some(QuoteTask::Value(second, level));
+            }
+            Some(QuoteFrame::MakePair(first)) => result = Some(pair(first, term)),
+            Some(QuoteFrame::MakeSucc) => result = Some(succ(term)),
+            Some(QuoteFrame::NeutralAppArgument { argument, level }) => {
+                frames.push(QuoteFrame::MakeApp(term));
+                task = Some(QuoteTask::Value(argument, level));
+            }
+            Some(QuoteFrame::MakeApp(function)) => result = Some(app(function, term)),
+            Some(QuoteFrame::MakeFst) => result = Some(Rc::new(Expr::Fst(term))),
+            Some(QuoteFrame::MakeSnd) => result = Some(Rc::new(Expr::Snd(term))),
+        }
+    }
+}
+fn quote(value: &Value, level: usize, config: EvalConfig) -> Result<Term, KernelError> {
+    quote_task(QuoteTask::Value(value.clone(), level), config)
+}
+#[allow(dead_code)]
+fn quote_neutral(neutral: &Neutral, level: usize, config: EvalConfig) -> Result<Term, KernelError> {
+    quote_task(QuoteTask::Neutral(Rc::new(neutral.clone()), level), config)
+}
+
+/// Normalization by evaluation for closed terms.
+pub fn normalize(term: &Term) -> Result<Term, KernelError> {
+    normalize_with_config(term, EvalConfig::default())
+}
+/// Normalize a closed term using `config` for evaluation and reification.
+///
+/// Fuel is a per-machine budget: evaluation and quotation each receive the
+/// configured limit. Exhaustion is reported as `KernelError::OutOfFuel`.
+pub fn normalize_with_config(term: &Term, config: EvalConfig) -> Result<Term, KernelError> {
+    quote(&eval(term, config)?, 0, config)
+}
+
+#[derive(Clone, Default)]
+struct Context {
+    types: Env,
+    values: Env,
+    config: EvalConfig,
+}
+impl Context {
+    fn extend(&self, ty: Value) -> Self {
+        Self {
+            types: self.types.extend(ty),
+            values: self
+                .values
+                .extend(Rc::new(Val::Neutral(Neutral::Var(self.values.len)))),
+            config: self.config,
+        }
+    }
+    fn eval(&self, term: &Term) -> Result<Value, KernelError> {
+        Evaluator {
+            remaining: self.config.fuel,
+        }
+        .eval(term, &self.values)
+    }
+}
+
+fn universe_level(value: &Value) -> Result<u32, KernelError> {
+    if let Val::Universe(i) = value.as_ref() {
+        Ok(*i)
+    } else {
+        Err(KernelError::ExpectedType)
+    }
+}
+fn same(a: &Value, b: &Value, level: usize, config: EvalConfig) -> Result<bool, KernelError> {
+    Ok(quote(a, level, config)? == quote(b, level, config)?)
+}
+/// MLTT universes are cumulative: a term inhabiting `Type_i` also inhabits
+/// `Type_j` whenever `i <= j`. Other conversion remains NbE structural equality.
+fn assignable(
+    expected: &Value,
+    found: &Value,
+    level: usize,
+    config: EvalConfig,
+) -> Result<bool, KernelError> {
+    match (expected.as_ref(), found.as_ref()) {
+        (Val::Universe(expected_level), Val::Universe(found_level)) => {
+            Ok(found_level <= expected_level)
+        }
+        _ => same(expected, found, level, config),
+    }
+}
+fn mismatch(
+    expected: &Value,
+    found: &Value,
+    level: usize,
+    config: EvalConfig,
+) -> Result<KernelError, KernelError> {
+    Ok(KernelError::TypeMismatch {
+        expected: quote(expected, level, config)?,
+        found: quote(found, level, config)?,
+    })
+}
+
+fn infer_in(ctx: &Context, term: &Term) -> Result<Value, KernelError> {
+    // A dependent-type spine has one body binder per layer.  Process the entire
+    // Pi/Sigma run on the heap rather than nesting Rust calls per binder.
+    let mut cursor = term.clone();
+    let mut active = ctx.clone();
+    let mut levels = Vec::new();
+    loop {
+        let (domain, body) = match cursor.as_ref() {
+            Expr::Pi { domain, codomain } => (domain.clone(), codomain.clone()),
+            Expr::Sigma { first, second } => (first.clone(), second.clone()),
+            _ => break,
+        };
+        let level = universe_level(&infer_in(&active, &domain)?)?;
+        let domain_value = active.eval(&domain)?;
+        active = active.extend(domain_value);
+        levels.push(level);
+        cursor = body;
+    }
+    if !levels.is_empty() {
+        let mut level = universe_level(&infer_in(&active, &cursor)?)?;
+        for outer in levels {
+            level = level.max(outer);
+        }
+        return Ok(Rc::new(Val::Universe(level)));
+    }
+    match term.as_ref() {
+        Expr::Var(i) => ctx.types.get(*i).ok_or(KernelError::UnboundVariable(*i)),
+        Expr::Universe(i) => Ok(Rc::new(Val::Universe(i + 1))),
+        Expr::Pi { domain, codomain } => {
+            let d_ty = infer_in(ctx, domain)?;
+            let dl = universe_level(&d_ty)?;
+            let domain_v = ctx.eval(domain)?;
+            let c_ty = infer_in(&ctx.extend(domain_v), codomain)?;
+            let cl = universe_level(&c_ty)?;
+            Ok(Rc::new(Val::Universe(dl.max(cl))))
+        }
+        Expr::Sigma { first, second } => {
+            let f_ty = infer_in(ctx, first)?;
+            let fl = universe_level(&f_ty)?;
+            let first_v = ctx.eval(first)?;
+            let s_ty = infer_in(&ctx.extend(first_v), second)?;
+            let sl = universe_level(&s_ty)?;
+            Ok(Rc::new(Val::Universe(fl.max(sl))))
+        }
+        Expr::Lam(_) => Err(KernelError::CannotInferLambda),
+        Expr::App { function, argument } => match infer_in(ctx, function)?.as_ref() {
+            Val::Pi(domain, codomain) => {
+                check_in(ctx, argument, domain)?;
+                let arg = ctx.eval(argument)?;
+                Evaluator {
+                    remaining: ctx.config.fuel,
+                }
+                .close(codomain, arg)
+            }
+            _ => Err(KernelError::ExpectedFunction),
+        },
+        Expr::Pair { .. } => Err(KernelError::CannotInferLambda),
+        Expr::Fst(p) => match infer_in(ctx, p)?.as_ref() {
+            Val::Sigma(first, _) => Ok(first.clone()),
+            _ => Err(KernelError::ExpectedPair),
+        },
+        Expr::Snd(p) => match infer_in(ctx, p)?.as_ref() {
+            Val::Sigma(_, second) => {
+                let p = ctx.eval(p)?;
+                let first = Evaluator {
+                    remaining: ctx.config.fuel,
+                }
+                .fst(p)?;
+                Evaluator {
+                    remaining: ctx.config.fuel,
+                }
+                .close(second, first)
+            }
+            _ => Err(KernelError::ExpectedPair),
+        },
+        Expr::Nat => Ok(Rc::new(Val::Universe(0))),
+        Expr::Zero => Ok(Rc::new(Val::Nat)),
+        Expr::Succ(n) => {
+            let mut base = n.clone();
+            while let Expr::Succ(next) = base.as_ref() {
+                base = next.clone();
+            }
+            check_in(ctx, &base, &Rc::new(Val::Nat))?;
+            Ok(Rc::new(Val::Nat))
+        }
+    }
+}
+
+fn check_in(ctx: &Context, term: &Term, expected: &Value) -> Result<(), KernelError> {
+    match (term.as_ref(), expected.as_ref()) {
+        (Expr::Lam(body), Val::Pi(domain, codomain)) => {
+            let extended = ctx.extend(domain.clone());
+            let x = extended
+                .values
+                .get(0)
+                .expect("extended context has its binder");
+            check_in(
+                &extended,
+                body,
+                &Evaluator {
+                    remaining: ctx.config.fuel,
+                }
+                .close(codomain, x)?,
+            )
+        }
+        (Expr::Pair { first, second }, Val::Sigma(first_ty, second_ty)) => {
+            check_in(ctx, first, first_ty)?;
+            let first_v = ctx.eval(first)?;
+            check_in(
+                ctx,
+                second,
+                &Evaluator {
+                    remaining: ctx.config.fuel,
+                }
+                .close(second_ty, first_v)?,
+            )
+        }
+        _ => {
+            let found = infer_in(ctx, term)?;
+            if assignable(expected, &found, ctx.values.len, ctx.config)? {
+                Ok(())
+            } else {
+                Err(mismatch(expected, &found, ctx.values.len, ctx.config)?)
+            }
+        }
+    }
+}
+
+/// Infer a closed term's type, returned in normal form.
+pub fn infer(term: &Term) -> Result<Term, KernelError> {
+    infer_with_config(term, EvalConfig::default())
+}
+/// Infer a closed term's type with a caller-selected resource budget.
+pub fn infer_with_config(term: &Term, config: EvalConfig) -> Result<Term, KernelError> {
+    let ctx = Context {
+        config,
+        ..Context::default()
+    };
+    quote(&infer_in(&ctx, term)?, 0, config)
+}
+/// Check a closed term against a closed type.
+pub fn check(term: &Term, ty: &Term) -> Result<(), KernelError> {
+    check_with_config(term, ty, EvalConfig::default())
+}
+/// Check a closed term against a closed type with a caller-selected budget.
+pub fn check_with_config(term: &Term, ty: &Term, config: EvalConfig) -> Result<(), KernelError> {
+    let ctx = Context {
+        config,
+        ..Context::default()
+    };
+    let expected = ctx.eval(ty)?;
+    check_in(&ctx, term, &expected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rc_sharing_is_the_term_representation() {
+        let n = nat();
+        let p = pi(n.clone(), n.clone());
+        assert_eq!(Rc::strong_count(&n), 3);
+        assert_eq!(infer(&p).unwrap(), universe(0));
+    }
+    #[test]
+    fn universe_cumulativity_starts_correctly() {
+        assert_eq!(infer(&universe(2)).unwrap(), universe(3));
+    }
+    #[test]
+    fn universes_are_cumulative() {
+        // Nat : Type0, and cumulative conversion admits Type0 <= Type1.
+        check(&nat(), &universe(1)).unwrap();
+        assert!(check(&universe(1), &universe(2)).is_ok());
+    }
+    #[test]
+    fn pi_and_nbe_beta_reduce() {
+        let id_ty = pi(nat(), nat());
+        let id = lam(var(0));
+        let applied = app(id.clone(), succ(zero()));
+        check(&id, &id_ty).unwrap();
+        assert_eq!(normalize(&applied).unwrap(), succ(zero()));
+    }
+    #[test]
+    fn sigma_pair_and_projections() {
+        let ty = sigma(nat(), nat());
+        let value = pair(zero(), succ(zero()));
+        check(&value, &ty).unwrap();
+        assert_eq!(
+            normalize(&Rc::new(Expr::Fst(value.clone()))).unwrap(),
+            zero()
+        );
+        assert_eq!(normalize(&Rc::new(Expr::Snd(value))).unwrap(), succ(zero()));
+    }
+    #[test]
+    fn evaluation_has_explicit_stack_cpu_budget() {
+        assert!(matches!(
+            eval(&zero(), EvalConfig { fuel: 0 }),
+            Err(KernelError::OutOfFuel)
+        ));
+        assert!(eval(&succ(zero()), EvalConfig { fuel: 2 }).is_ok());
+    }
+    #[test]
+    fn persistent_environments_extend_in_constant_work_and_share_tails() {
+        let base = Env::default().extend(Rc::new(Val::Zero));
+        let child = base.extend(Rc::new(Val::Succ(Rc::new(Val::Zero))));
+        let base_head = base.head.as_ref().unwrap();
+        assert!(Rc::ptr_eq(
+            base_head,
+            child.head.as_ref().unwrap().previous.as_ref().unwrap()
+        ));
+        assert_eq!(Rc::strong_count(base_head), 2);
+
+        // This is a structural, not timing-sensitive, regression test: every
+        // extension has exactly one new node and shares the preceding 100,000.
+        let mut env = Env::default();
+        for _ in 0..100_000 {
+            env = env.extend(Rc::new(Val::Zero));
+        }
+        assert_eq!(env.len, 100_000);
+        // Scope exit drops all 100,000 nodes normally via EnvNode's iterative Drop.
+    }
+    #[test]
+    fn deep_unary_naturals_do_not_use_native_recursion_in_hot_paths() {
+        const DEPTH: usize = 50_000;
+        let mut term = zero();
+        for _ in 0..DEPTH {
+            term = succ(term);
+        }
+        let value = eval(&term, EvalConfig { fuel: DEPTH + 1 }).unwrap();
+        let normal = quote(&value, 0, EvalConfig::default()).unwrap();
+        assert_eq!(infer(&term).unwrap(), nat());
+        check(&term, &nat()).unwrap();
+        drop(normal);
+        drop(value);
+        drop(term);
+    }
+    #[test]
+    fn deep_application_spine_evaluates_quotes_and_drops_normally() {
+        const DEPTH: usize = 50_000;
+        let identity = lam(var(0));
+        let mut term = zero();
+        // Right-associated applications exercise argument continuations too.
+        for _ in 0..DEPTH {
+            term = app(identity.clone(), term);
+        }
+        let value = eval(
+            &term,
+            EvalConfig {
+                fuel: DEPTH * 3 + 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(quote(&value, 0, EvalConfig::default()).unwrap(), zero());
+        drop(value);
+        drop(term);
+    }
+    #[test]
+    fn deep_pi_spine_infers_checks_and_drops_normally() {
+        const DEPTH: usize = 50_000;
+        let mut term = nat();
+        for _ in 0..DEPTH {
+            term = pi(nat(), term);
+        }
+        assert_eq!(infer(&term).unwrap(), universe(0));
+        check(&term, &universe(0)).unwrap();
+        drop(term);
+    }
+    #[test]
+    fn quote_reifies_a_deep_pi_value_tree() {
+        const DEPTH: usize = 50_000;
+        let mut term = nat();
+        for _ in 0..DEPTH {
+            term = pi(nat(), term);
+        }
+        let normal = normalize(&term).unwrap();
+        assert!(matches!(normal.as_ref(), Expr::Pi { .. }));
+        drop(normal);
+        drop(term);
+    }
+    #[test]
+    fn quote_reifies_a_deep_pair_value_tree() {
+        const DEPTH: usize = 50_000;
+        let mut term = zero();
+        for _ in 0..DEPTH {
+            term = pair(zero(), term);
+        }
+        let value = eval(
+            &term,
+            EvalConfig {
+                fuel: DEPTH * 2 + 1,
+            },
+        )
+        .unwrap();
+        let normal = quote(&value, 0, EvalConfig::default()).unwrap();
+        assert!(matches!(normal.as_ref(), Expr::Pair { .. }));
+        drop(normal);
+        drop(value);
+        drop(term);
+    }
+    #[test]
+    fn quote_reifies_a_deep_neutral_application_spine() {
+        const DEPTH: usize = 50_000;
+        let mut neutral = Rc::new(Neutral::Var(0));
+        for _ in 0..DEPTH {
+            neutral = Rc::new(Neutral::App(neutral, Rc::new(Val::Zero)));
+        }
+        let term = quote_neutral(&neutral, 1, EvalConfig::default()).unwrap();
+        assert!(matches!(term.as_ref(), Expr::App { .. }));
+        drop(term);
+        drop(neutral);
+    }
+    #[test]
+    fn inductive_parameters_and_indices_are_distinct() {
+        let vec = InductiveDecl {
+            name: "Vec".into(),
+            params: vec![Binder {
+                name: "A".into(),
+                ty: universe(0),
+            }],
+            indices: vec![Binder {
+                name: "n".into(),
+                ty: nat(),
+            }],
+            universe: 0,
+            constructors: vec![ConstructorDecl {
+                name: "nil".into(),
+                fields: vec![],
+                result_indices: vec![zero()],
+            }],
+        };
+        vec.validate_shape().unwrap();
+        let bad = InductiveDecl {
+            constructors: vec![ConstructorDecl {
+                name: "broken".into(),
+                fields: vec![],
+                result_indices: vec![],
+            }],
+            ..vec
+        };
+        assert!(matches!(
+            bad.validate_shape(),
+            Err(KernelError::InvalidInductive(_))
+        ));
+    }
+
+    #[test]
+    fn public_kernel_operations_honor_the_callers_fuel_budget() {
+        let term = succ(zero());
+        let no_fuel = EvalConfig { fuel: 0 };
+        assert!(matches!(
+            normalize_with_config(&term, no_fuel),
+            Err(KernelError::OutOfFuel)
+        ));
+        assert!(matches!(
+            infer_with_config(&pi(nat(), nat()), no_fuel),
+            Err(KernelError::OutOfFuel)
+        ));
+        assert!(matches!(
+            check_with_config(&term, &nat(), no_fuel),
+            Err(KernelError::OutOfFuel)
+        ));
+    }
+
+    #[test]
+    fn malformed_terms_report_their_typing_error_not_resource_exhaustion() {
+        assert!(matches!(
+            infer(&var(0)),
+            Err(KernelError::UnboundVariable(0))
+        ));
+        assert!(matches!(check(&zero(), &nat()), Ok(())));
+        assert!(matches!(
+            check(&zero(), &pi(nat(), nat())),
+            Err(KernelError::TypeMismatch { .. })
+        ));
+        assert!(matches!(
+            normalize(&app(zero(), zero())),
+            Err(KernelError::ExpectedFunction)
+        ));
+    }
+}
