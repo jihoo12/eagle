@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Eagle's deliberately small MLTT kernel.
 //!
 //! Syntax uses de Bruijn *indices*; semantic neutrals use de Bruijn *levels*.
@@ -5,305 +6,19 @@
 //! `docs/core-language.md` for the current core-language contract and
 //! `docs/cubical-extension.md` for the separate dimension-context plan.
 
-use std::fmt;
 use std::rc::Rc;
 
-pub type Term = Rc<Expr>;
-pub type Value = Rc<Val>;
+use semantic::Env;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Expr {
-    Var(usize),
-    Universe(u32),
-    Pi { domain: Term, codomain: Term },
-    Lam(Term),
-    App { function: Term, argument: Term },
-    Sigma { first: Term, second: Term },
-    Pair { first: Term, second: Term },
-    Fst(Term),
-    Snd(Term),
-    Nat,
-    Zero,
-    Succ(Term),
-}
+mod error;
+mod inductive;
+mod semantic;
+mod syntax;
 
-pub fn var(index: usize) -> Term {
-    Rc::new(Expr::Var(index))
-}
-pub fn universe(level: u32) -> Term {
-    Rc::new(Expr::Universe(level))
-}
-pub fn pi(domain: Term, codomain: Term) -> Term {
-    Rc::new(Expr::Pi { domain, codomain })
-}
-pub fn lam(body: Term) -> Term {
-    Rc::new(Expr::Lam(body))
-}
-pub fn app(function: Term, argument: Term) -> Term {
-    Rc::new(Expr::App { function, argument })
-}
-pub fn sigma(first: Term, second: Term) -> Term {
-    Rc::new(Expr::Sigma { first, second })
-}
-pub fn pair(first: Term, second: Term) -> Term {
-    Rc::new(Expr::Pair { first, second })
-}
-pub fn nat() -> Term {
-    Rc::new(Expr::Nat)
-}
-pub fn zero() -> Term {
-    Rc::new(Expr::Zero)
-}
-pub fn succ(term: Term) -> Term {
-    Rc::new(Expr::Succ(term))
-}
-
-/// A binder in an inductive declaration.  Parameters are fixed for every
-/// constructor/result; indices may vary and are the inputs to elimination.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Binder {
-    pub name: String,
-    pub ty: Term,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConstructorDecl {
-    pub name: String,
-    pub fields: Vec<Binder>,
-    /// The result's index arguments, one for each `InductiveDecl::indices`.
-    pub result_indices: Vec<Term>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InductiveDecl {
-    pub name: String,
-    pub params: Vec<Binder>,
-    pub indices: Vec<Binder>,
-    pub universe: u32,
-    pub constructors: Vec<ConstructorDecl>,
-}
-
-impl InductiveDecl {
-    /// Structural validation owned by the trusted declaration boundary.  Full
-    /// positivity and constructor type checking belong to the next kernel step.
-    pub fn validate_shape(&self) -> Result<(), KernelError> {
-        if self.constructors.is_empty() {
-            return Err(KernelError::InvalidInductive(
-                "an inductive needs a constructor",
-            ));
-        }
-        if self
-            .params
-            .iter()
-            .chain(&self.indices)
-            .any(|b| b.name.is_empty())
-        {
-            return Err(KernelError::InvalidInductive("binders need names"));
-        }
-        if self
-            .constructors
-            .iter()
-            .any(|c| c.result_indices.len() != self.indices.len())
-        {
-            return Err(KernelError::InvalidInductive(
-                "constructor result has the wrong number of indices",
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
-pub enum Val {
-    Universe(u32),
-    Pi(Value, Closure),
-    Sigma(Value, Closure),
-    Lam(Closure),
-    Nat,
-    Zero,
-    Succ(Value),
-    Pair(Value, Value),
-    Neutral(Neutral),
-}
-
-impl fmt::Debug for Val {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Universe(n) => write!(f, "Type({n})"),
-            Self::Pi(..) => write!(f, "Pi(..)"),
-            Self::Sigma(..) => write!(f, "Sigma(..)"),
-            Self::Lam(..) => write!(f, "Lam(..)"),
-            Self::Nat => write!(f, "Nat"),
-            Self::Zero => write!(f, "zero"),
-            Self::Succ(v) => f.debug_tuple("succ").field(v).finish(),
-            Self::Pair(a, b) => f.debug_tuple("pair").field(a).field(b).finish(),
-            Self::Neutral(n) => n.fmt(f),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Closure {
-    env: Env,
-    body: Term,
-}
-
-/// A persistent environment. `extend` allocates one node and shares its tail;
-/// closure capture is therefore an O(1) clone of the environment handle.
-#[derive(Clone, Debug, Default)]
-struct Env {
-    head: Option<Rc<EnvNode>>,
-    len: usize,
-}
-#[derive(Debug)]
-struct EnvNode {
-    value: Value,
-    previous: Option<Rc<EnvNode>>,
-}
-impl Env {
-    fn extend(&self, value: Value) -> Self {
-        Self {
-            head: Some(Rc::new(EnvNode {
-                value,
-                previous: self.head.clone(),
-            })),
-            len: self.len + 1,
-        }
-    }
-    /// De Bruijn index lookup: zero denotes the most recent binder.
-    fn get(&self, index: usize) -> Option<Value> {
-        let mut node = self.head.as_ref()?;
-        for _ in 0..index {
-            node = node.previous.as_ref()?;
-        }
-        Some(node.value.clone())
-    }
-}
-#[derive(Clone, Debug)]
-pub enum Neutral {
-    Var(usize),
-    App(Rc<Neutral>, Value),
-    Fst(Rc<Neutral>),
-    Snd(Rc<Neutral>),
-}
-
-// `Rc` only avoids recursive destruction when a shared tail remains.  These
-// destructors drain uniquely-owned chains explicitly, keeping normal teardown
-// of stress-sized syntax, values, and environments off the native stack.
-impl Drop for EnvNode {
-    fn drop(&mut self) {
-        let mut next = self.previous.take();
-        while let Some(node) = next {
-            match Rc::try_unwrap(node) {
-                Ok(mut node) => next = node.previous.take(),
-                Err(_) => break,
-            }
-        }
-    }
-}
-fn take_expr_children(expr: &mut Expr, work: &mut Vec<Term>) {
-    let empty = || Rc::new(Expr::Zero);
-    match expr {
-        Expr::Pi { domain, codomain }
-        | Expr::Sigma {
-            first: domain,
-            second: codomain,
-        } => {
-            work.push(std::mem::replace(domain, empty()));
-            work.push(std::mem::replace(codomain, empty()));
-        }
-        Expr::Lam(body) | Expr::Fst(body) | Expr::Snd(body) | Expr::Succ(body) => {
-            work.push(std::mem::replace(body, empty()))
-        }
-        Expr::App { function, argument }
-        | Expr::Pair {
-            first: function,
-            second: argument,
-        } => {
-            work.push(std::mem::replace(function, empty()));
-            work.push(std::mem::replace(argument, empty()));
-        }
-        Expr::Var(_) | Expr::Universe(_) | Expr::Nat | Expr::Zero => {}
-    }
-}
-impl Drop for Expr {
-    fn drop(&mut self) {
-        let mut work = Vec::new();
-        take_expr_children(self, &mut work);
-        while let Some(node) = work.pop() {
-            if let Ok(mut node) = Rc::try_unwrap(node) {
-                take_expr_children(&mut node, &mut work);
-            }
-        }
-    }
-}
-fn take_val_children(value: &mut Val, work: &mut Vec<Value>) {
-    match value {
-        Val::Pi(domain, closure) | Val::Sigma(domain, closure) => {
-            work.push(std::mem::replace(domain, Rc::new(Val::Zero)));
-            closure.env = Env::default();
-            let body = std::mem::replace(&mut closure.body, zero());
-            drop(body);
-        }
-        Val::Lam(closure) => {
-            closure.env = Env::default();
-            let body = std::mem::replace(&mut closure.body, zero());
-            drop(body);
-        }
-        Val::Succ(inner) => work.push(std::mem::replace(inner, Rc::new(Val::Zero))),
-        Val::Pair(a, b) => {
-            work.push(std::mem::replace(a, Rc::new(Val::Zero)));
-            work.push(std::mem::replace(b, Rc::new(Val::Zero)));
-        }
-        Val::Universe(_) | Val::Nat | Val::Zero | Val::Neutral(_) => {}
-    }
-}
-impl Drop for Val {
-    fn drop(&mut self) {
-        let mut work = Vec::new();
-        take_val_children(self, &mut work);
-        while let Some(node) = work.pop() {
-            if let Ok(mut node) = Rc::try_unwrap(node) {
-                take_val_children(&mut node, &mut work);
-            }
-        }
-    }
-}
-fn take_neutral_head(neutral: &mut Neutral) -> Option<Rc<Neutral>> {
-    match neutral {
-        Neutral::Var(_) => None,
-        Neutral::App(head, argument) => {
-            drop(std::mem::replace(argument, Rc::new(Val::Zero)));
-            Some(std::mem::replace(head, Rc::new(Neutral::Var(0))))
-        }
-        Neutral::Fst(head) | Neutral::Snd(head) => {
-            Some(std::mem::replace(head, Rc::new(Neutral::Var(0))))
-        }
-    }
-}
-impl Drop for Neutral {
-    fn drop(&mut self) {
-        let mut next = take_neutral_head(self);
-        while let Some(node) = next {
-            match Rc::try_unwrap(node) {
-                Ok(mut node) => next = take_neutral_head(&mut node),
-                Err(_) => break,
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KernelError {
-    UnboundVariable(usize),
-    ExpectedFunction,
-    ExpectedPair,
-    ExpectedType,
-    TypeMismatch { expected: Term, found: Term },
-    CannotInferLambda,
-    OutOfFuel,
-    InvalidInductive(&'static str),
-}
+pub use error::KernelError;
+pub use inductive::{Binder, ConstructorDecl, InductiveDecl};
+pub use semantic::{Closure, Neutral, Val, Value};
+pub use syntax::{app, lam, nat, pair, pi, sigma, succ, universe, var, zero, Expr, Term};
 
 /// Evaluation uses a heap-allocated CEK-style work stack and explicit fuel.
 /// Well-typed MLTT terms normalize; fuel makes the remaining CPU policy explicit.
@@ -412,7 +127,7 @@ impl Evaluator {
                     current = Some((argument, env));
                 }
                 Some(EvalFrame::Apply(function)) => match function.as_ref() {
-                    Val::Lam(closure) | Val::Pi(_, closure) => {
+                    Val::Lam(closure) => {
                         current = Some((closure.body.clone(), closure.env.extend(result)))
                     }
                     Val::Neutral(neutral) => {
@@ -865,6 +580,15 @@ mod tests {
         assert_eq!(normalize(&applied).unwrap(), succ(zero()));
     }
     #[test]
+    fn conversion_has_beta_but_no_unrequested_eta_rule() {
+        // \f. \x. f x is eta-equivalent to \f. f in some presentations, but
+        // the current core intentionally specifies beta conversion only.
+        let eta_expansion = lam(lam(app(var(1), var(0))));
+        let ty = pi(pi(nat(), nat()), pi(nat(), nat()));
+        check(&eta_expansion, &ty).unwrap();
+        assert_eq!(normalize(&eta_expansion).unwrap(), eta_expansion);
+    }
+    #[test]
     fn sigma_pair_and_projections() {
         let ty = sigma(nat(), nat());
         let value = pair(zero(), succ(zero()));
@@ -1058,6 +782,10 @@ mod tests {
         ));
         assert!(matches!(
             normalize(&app(zero(), zero())),
+            Err(KernelError::ExpectedFunction)
+        ));
+        assert!(matches!(
+            normalize(&app(pi(nat(), nat()), zero())),
             Err(KernelError::ExpectedFunction)
         ));
     }

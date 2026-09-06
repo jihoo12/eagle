@@ -29,9 +29,9 @@ t, A ::= #n                         variable
        | Nat | zero | succ t         natural numbers
 ```
 
-The Rust representation is `Expr`; all subterms are immutable shared `Rc`
-values.  The public constructor helpers in `src/lib.rs` construct exactly the
-grammar above.
+The Rust representation is `Expr` in `src/syntax.rs`; all subterms are
+immutable shared `Rc` values.  `src/lib.rs` re-exports its public constructor
+helpers, preserving the crate's compact embedding API.
 
 ## Typing and computation obligations
 

@@ -46,21 +46,24 @@ The immediate code base already supplies a useful foundation:
 
 **Goal:** create a dependable baseline before changing the semantic domain.
 
-- Split `src/lib.rs` by responsibility without changing behavior:
-  `syntax`, `semantic`, `eval`, `quote`, `check`, `inductive`, and `error`.
-  Keep the public API small and add re-exports while the split is underway.
-- Define a documented core-language grammar and the invariant for each AST
+- [x] Split `src/lib.rs` by responsibility without changing behavior:
+  `syntax`, `semantic`, `inductive`, and `error` now have internal modules;
+  evaluation, quotation, and checking remain co-located while they share the
+  same private evaluator.  The public API is re-exported from `lib.rs`.
+- [x] Define a documented core-language grammar and the invariant for each AST
   constructor: its binders, universe level, and expected evaluation behavior.
-- Make evaluator fuel configurable at all public entry points, including
+- [x] Make evaluator fuel configurable at all public entry points, including
   normalization and conversion; distinguish resource exhaustion from an
   ill-typed term in diagnostics.
-- Add golden/unit tests for beta/eta behavior, cumulativity boundaries,
+- [x] Add golden/unit tests for beta/eta behavior, cumulativity boundaries,
   dependent `Sigma` projection, neutral spines, and malformed terms.
-- Run formatting, Clippy, unit tests, and deep-stack regressions in CI.
+- [x] Run formatting, Clippy, unit tests, and deep-stack regressions in CI.
 
-**Exit criteria:** all present behavior is regression-tested; the core can be
-refactored without changing its observable API or introducing recursion in hot
-paths.
+**Exit criteria:** met: all present behavior is regression-tested; the core
+can be refactored without changing its observable API or introducing recursion
+in hot paths.  `docs/trusted-base.md` records the trusted boundary.
+
+---
 
 ## Milestone 1 — Global signature and ordinary inductive families
 
