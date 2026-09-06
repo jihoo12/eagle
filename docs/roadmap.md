@@ -70,8 +70,25 @@ in hot paths.  `docs/trusted-base.md` records the trusted boundary.
 **Goal:** replace shape-only declarations with a checked, persistent global
 signature, before mixing inductives with cubical composition.
 
-- Introduce a `Signature` containing constants, opaque/transparent
-  definitions, inductive declarations, constructors, and eliminators.
+- [~] Introduce a persistent `Signature` containing checked opaque/transparent
+  definitions and inductive declarations.  The registry now rejects duplicate
+  declaration and constructor names.  Resolved global core references now
+  evaluate through the signature (transparent definitions unfold; opaque names
+  stay neutral).  Signature-aware inference and checking now use registered
+  definition types; constructors and eliminators are the next implementation
+  slice.
+- [~] Add an executable initial inductive fragment: non-parameterized,
+  non-indexed types with closed constructor fields now synthesize constructor
+  Pi types and normalize as neutral constructor spines.  Parameters, indices,
+  recursion/positivity, and eliminators remain intentionally rejected until
+  their full computation rules are implemented.
+- [x] Harden the declaration boundary for the implemented fragment: inductive
+  and constructor names are non-empty and constructor names are unique before
+  a declaration reaches the global registry.
+- [~] Add a conservative strict-positivity pass which rejects negative
+  recursive occurrences before constructor fields are admitted.  Positive
+  recursion remains unavailable until it has explicit inductive applications
+  and eliminator computation rules.
 - Type-check declaration parameters, indices, constructor fields, and result
   indices in the correct telescopic contexts.  Reject duplicate names and
   dangling references.

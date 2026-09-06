@@ -17,6 +17,6 @@ jobs:
           components: rustfmt, clippy
       # Keep the kernel's formatting gate independent of the intentionally
       # empty CLI entry point while Milestone 8 has not started.
-      - run: rustfmt --check src/lib.rs src/syntax.rs src/semantic.rs src/error.rs src/inductive.rs
+      - run: rustfmt --check src/lib.rs src/syntax.rs src/semantic.rs src/error.rs src/inductive.rs src/signature.rs
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets

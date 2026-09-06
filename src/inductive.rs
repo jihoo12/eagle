@@ -44,6 +44,30 @@ impl InductiveDecl {
         {
             return Err(KernelError::InvalidInductive("binders need names"));
         }
+        if self.name.is_empty() {
+            return Err(KernelError::InvalidInductive("inductive names need names"));
+        }
+        if self
+            .constructors
+            .iter()
+            .any(|constructor| constructor.name.is_empty())
+        {
+            return Err(KernelError::InvalidInductive("constructors need names"));
+        }
+        if self
+            .constructors
+            .iter()
+            .enumerate()
+            .any(|(index, constructor)| {
+                self.constructors[index + 1..]
+                    .iter()
+                    .any(|other| other.name == constructor.name)
+            })
+        {
+            return Err(KernelError::InvalidInductive(
+                "constructor names must be distinct",
+            ));
+        }
         if self
             .constructors
             .iter()

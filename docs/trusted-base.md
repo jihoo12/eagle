@@ -11,7 +11,8 @@ before cubical features expand it.
 | `src/syntax.rs` | Well-scoped core representation and its iterative teardown. |
 | `src/semantic.rs` | Semantic values, closures, environments, neutrals, and iterative teardown. |
 | `src/lib.rs` | Evaluation, quotation, conversion, bidirectional type checking, and public kernel entry points. |
-| `src/inductive.rs` | Structural inductive-declaration validation. |
+| `src/inductive.rs` | Structural inductive-declaration syntax and validation. |
+| `src/signature.rs` | Persistent global registry and admission checks for the current inductive fragment. |
 | `src/error.rs` | Kernel error representation. |
 
 The crate forbids `unsafe` code.  Resource budgets are part of the kernel

@@ -10,12 +10,26 @@ pub type Term = Rc<Expr>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Expr {
     Var(usize),
+    /// A resolved global name. Name resolution is an untrusted front-end task.
+    Global(String),
     Universe(u32),
-    Pi { domain: Term, codomain: Term },
+    Pi {
+        domain: Term,
+        codomain: Term,
+    },
     Lam(Term),
-    App { function: Term, argument: Term },
-    Sigma { first: Term, second: Term },
-    Pair { first: Term, second: Term },
+    App {
+        function: Term,
+        argument: Term,
+    },
+    Sigma {
+        first: Term,
+        second: Term,
+    },
+    Pair {
+        first: Term,
+        second: Term,
+    },
     Fst(Term),
     Snd(Term),
     Nat,
@@ -25,6 +39,9 @@ pub enum Expr {
 
 pub fn var(index: usize) -> Term {
     Rc::new(Expr::Var(index))
+}
+pub fn global(name: impl Into<String>) -> Term {
+    Rc::new(Expr::Global(name.into()))
 }
 pub fn universe(level: u32) -> Term {
     Rc::new(Expr::Universe(level))

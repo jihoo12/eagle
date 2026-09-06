@@ -77,6 +77,7 @@ impl Env {
 #[derive(Clone, Debug)]
 pub enum Neutral {
     Var(usize),
+    Global(String),
     App(Rc<Neutral>, Value),
     Fst(Rc<Neutral>),
     Snd(Rc<Neutral>),
@@ -119,7 +120,7 @@ pub(crate) fn take_expr_children(expr: &mut Expr, work: &mut Vec<Term>) {
             work.push(std::mem::replace(function, empty()));
             work.push(std::mem::replace(argument, empty()));
         }
-        Expr::Var(_) | Expr::Universe(_) | Expr::Nat | Expr::Zero => {}
+        Expr::Var(_) | Expr::Global(_) | Expr::Universe(_) | Expr::Nat | Expr::Zero => {}
     }
 }
 impl Drop for Expr {
@@ -167,7 +168,7 @@ impl Drop for Val {
 }
 fn take_neutral_head(neutral: &mut Neutral) -> Option<Rc<Neutral>> {
     match neutral {
-        Neutral::Var(_) => None,
+        Neutral::Var(_) | Neutral::Global(_) => None,
         Neutral::App(head, argument) => {
             drop(std::mem::replace(argument, Rc::new(Val::Zero)));
             Some(std::mem::replace(head, Rc::new(Neutral::Var(0))))

@@ -13,12 +13,14 @@ use semantic::Env;
 mod error;
 mod inductive;
 mod semantic;
+mod signature;
 mod syntax;
 
 pub use error::KernelError;
 pub use inductive::{Binder, ConstructorDecl, InductiveDecl};
 pub use semantic::{Closure, Neutral, Val, Value};
-pub use syntax::{app, lam, nat, pair, pi, sigma, succ, universe, var, zero, Expr, Term};
+pub use signature::{Declaration, Definition, Signature};
+pub use syntax::{app, global, lam, nat, pair, pi, sigma, succ, universe, var, zero, Expr, Term};
 
 /// Evaluation uses a heap-allocated CEK-style work stack and explicit fuel.
 /// Well-typed MLTT terms normalize; fuel makes the remaining CPU policy explicit.
@@ -32,8 +34,9 @@ impl Default for EvalConfig {
     }
 }
 
-struct Evaluator {
+struct Evaluator<'signature> {
     remaining: usize,
+    signature: Option<&'signature Signature>,
 }
 enum EvalFrame {
     AppArgument { argument: Term, env: Env },
@@ -46,7 +49,7 @@ enum EvalFrame {
     Snd,
     Succ,
 }
-impl Evaluator {
+impl Evaluator<'_> {
     fn tick(&mut self) -> Result<(), KernelError> {
         if self.remaining == 0 {
             Err(KernelError::OutOfFuel)
@@ -67,6 +70,26 @@ impl Evaluator {
                     Expr::Var(i) => {
                         value = Some(env.get(*i).ok_or(KernelError::UnboundVariable(*i))?)
                     }
+                    Expr::Global(name) => match self
+                        .signature
+                        .and_then(|signature| signature.get(name))
+                    {
+                        Some(Declaration::Definition(Definition::Transparent { body, .. })) => {
+                            current = Some((body.clone(), env));
+                        }
+                        Some(Declaration::Definition(Definition::Opaque { .. }))
+                        | Some(Declaration::Inductive(_)) => {
+                            value = Some(Rc::new(Val::Neutral(Neutral::Global(name.clone()))));
+                        }
+                        None if self
+                            .signature
+                            .and_then(|signature| signature.constructor(name))
+                            .is_some() =>
+                        {
+                            value = Some(Rc::new(Val::Neutral(Neutral::Global(name.clone()))));
+                        }
+                        None => return Err(KernelError::UnknownGlobal(name.clone())),
+                    },
                     Expr::Universe(i) => value = Some(Rc::new(Val::Universe(*i))),
                     Expr::Lam(body) => {
                         value = Some(Rc::new(Val::Lam(Closure {
@@ -183,6 +206,22 @@ impl Evaluator {
 pub fn eval(term: &Term, config: EvalConfig) -> Result<Value, KernelError> {
     Evaluator {
         remaining: config.fuel,
+        signature: None,
+    }
+    .eval(term, &Env::default())
+}
+
+/// Evaluate a closed core term with resolved global names from `signature`.
+/// Transparent definitions unfold; opaque definitions and inductive names stay
+/// neutral until their core computation rules are available.
+pub fn eval_in_signature(
+    term: &Term,
+    signature: &Signature,
+    config: EvalConfig,
+) -> Result<Value, KernelError> {
+    Evaluator {
+        remaining: config.fuel,
+        signature: Some(signature),
     }
     .eval(term, &Env::default())
 }
@@ -214,6 +253,7 @@ fn quote_task(initial: QuoteTask, config: EvalConfig) -> Result<Term, KernelErro
     let mut frames = Vec::new();
     let mut ev = Evaluator {
         remaining: config.fuel,
+        signature: None,
     };
     loop {
         if let Some(task_now) = task.take() {
@@ -262,6 +302,7 @@ fn quote_task(initial: QuoteTask, config: EvalConfig) -> Result<Term, KernelErro
                             .checked_sub(*l + 1)
                             .ok_or(KernelError::UnboundVariable(*l))?))
                     }
+                    Neutral::Global(name) => result = Some(global(name.clone())),
                     Neutral::App(function, argument) => {
                         frames.push(QuoteFrame::NeutralAppArgument {
                             argument: argument.clone(),
@@ -335,13 +376,27 @@ pub fn normalize_with_config(term: &Term, config: EvalConfig) -> Result<Term, Ke
     quote(&eval(term, config)?, 0, config)
 }
 
+/// Normalize a closed term with resolved globals from `signature`.
+///
+/// This initial global fragment reifies transparent bodies that are already
+/// closed and constructor/opaque heads as neutrals.  Quotations that need to
+/// apply a closure carrying globals are added with eliminators.
+pub fn normalize_in_signature(
+    term: &Term,
+    signature: &Signature,
+    config: EvalConfig,
+) -> Result<Term, KernelError> {
+    quote(&eval_in_signature(term, signature, config)?, 0, config)
+}
+
 #[derive(Clone, Default)]
-struct Context {
+struct Context<'signature> {
     types: Env,
     values: Env,
     config: EvalConfig,
+    signature: Option<&'signature Signature>,
 }
-impl Context {
+impl Context<'_> {
     fn extend(&self, ty: Value) -> Self {
         Self {
             types: self.types.extend(ty),
@@ -349,11 +404,13 @@ impl Context {
                 .values
                 .extend(Rc::new(Val::Neutral(Neutral::Var(self.values.len)))),
             config: self.config,
+            signature: self.signature,
         }
     }
     fn eval(&self, term: &Term) -> Result<Value, KernelError> {
         Evaluator {
             remaining: self.config.fuel,
+            signature: self.signature,
         }
         .eval(term, &self.values)
     }
@@ -396,7 +453,7 @@ fn mismatch(
     })
 }
 
-fn infer_in(ctx: &Context, term: &Term) -> Result<Value, KernelError> {
+fn infer_in(ctx: &Context<'_>, term: &Term) -> Result<Value, KernelError> {
     // A dependent-type spine has one body binder per layer.  Process the entire
     // Pi/Sigma run on the heap rather than nesting Rust calls per binder.
     let mut cursor = term.clone();
@@ -423,6 +480,18 @@ fn infer_in(ctx: &Context, term: &Term) -> Result<Value, KernelError> {
     }
     match term.as_ref() {
         Expr::Var(i) => ctx.types.get(*i).ok_or(KernelError::UnboundVariable(*i)),
+        Expr::Global(name) => match ctx.signature.and_then(|signature| signature.get(name)) {
+            Some(Declaration::Definition(definition)) => ctx.eval(definition.ty()),
+            Some(Declaration::Inductive(inductive)) => {
+                Ok(Rc::new(Val::Universe(inductive.universe)))
+            }
+            None => match ctx.signature {
+                Some(signature) if signature.constructor(name).is_some() => {
+                    ctx.eval(&constructor_type(signature, name)?)
+                }
+                _ => Err(KernelError::UnknownGlobal(name.clone())),
+            },
+        },
         Expr::Universe(i) => Ok(Rc::new(Val::Universe(i + 1))),
         Expr::Pi { domain, codomain } => {
             let d_ty = infer_in(ctx, domain)?;
@@ -447,6 +516,7 @@ fn infer_in(ctx: &Context, term: &Term) -> Result<Value, KernelError> {
                 let arg = ctx.eval(argument)?;
                 Evaluator {
                     remaining: ctx.config.fuel,
+                    signature: ctx.signature,
                 }
                 .close(codomain, arg)
             }
@@ -462,10 +532,12 @@ fn infer_in(ctx: &Context, term: &Term) -> Result<Value, KernelError> {
                 let p = ctx.eval(p)?;
                 let first = Evaluator {
                     remaining: ctx.config.fuel,
+                    signature: ctx.signature,
                 }
                 .fst(p)?;
                 Evaluator {
                     remaining: ctx.config.fuel,
+                    signature: ctx.signature,
                 }
                 .close(second, first)
             }
@@ -484,7 +556,26 @@ fn infer_in(ctx: &Context, term: &Term) -> Result<Value, KernelError> {
     }
 }
 
-fn check_in(ctx: &Context, term: &Term, expected: &Value) -> Result<(), KernelError> {
+/// Construct the type of a zero-parameter, zero-index constructor from its
+/// field telescope.  The current declaration boundary accepts only closed
+/// field types, so this produces a closed Pi telescope.  Dependent fields,
+/// parameters, and indices are admitted together in the next declaration
+/// checker extension rather than being partially and unsafely approximated.
+fn constructor_type(signature: &Signature, name: &str) -> Result<Term, KernelError> {
+    let (inductive, constructor) = signature
+        .constructor(name)
+        .ok_or_else(|| KernelError::UnknownGlobal(name.to_owned()))?;
+    if !inductive.params.is_empty() || !inductive.indices.is_empty() {
+        return Err(KernelError::UnsupportedGlobal(name.to_owned()));
+    }
+    let mut ty = global(inductive.name.clone());
+    for field in constructor.fields.iter().rev() {
+        ty = pi(field.ty.clone(), ty);
+    }
+    Ok(ty)
+}
+
+fn check_in(ctx: &Context<'_>, term: &Term, expected: &Value) -> Result<(), KernelError> {
     match (term.as_ref(), expected.as_ref()) {
         (Expr::Lam(body), Val::Pi(domain, codomain)) => {
             let extended = ctx.extend(domain.clone());
@@ -497,6 +588,7 @@ fn check_in(ctx: &Context, term: &Term, expected: &Value) -> Result<(), KernelEr
                 body,
                 &Evaluator {
                     remaining: ctx.config.fuel,
+                    signature: ctx.signature,
                 }
                 .close(codomain, x)?,
             )
@@ -509,6 +601,7 @@ fn check_in(ctx: &Context, term: &Term, expected: &Value) -> Result<(), KernelEr
                 second,
                 &Evaluator {
                     remaining: ctx.config.fuel,
+                    signature: ctx.signature,
                 }
                 .close(second_ty, first_v)?,
             )
@@ -544,6 +637,37 @@ pub fn check(term: &Term, ty: &Term) -> Result<(), KernelError> {
 pub fn check_with_config(term: &Term, ty: &Term, config: EvalConfig) -> Result<(), KernelError> {
     let ctx = Context {
         config,
+        ..Context::default()
+    };
+    let expected = ctx.eval(ty)?;
+    check_in(&ctx, term, &expected)
+}
+
+/// Infer a closed term's type using declarations from `signature`.
+pub fn infer_in_signature(
+    term: &Term,
+    signature: &Signature,
+    config: EvalConfig,
+) -> Result<Term, KernelError> {
+    let ctx = Context {
+        config,
+        signature: Some(signature),
+        ..Context::default()
+    };
+    quote(&infer_in(&ctx, term)?, 0, config)
+}
+
+/// Check a closed term against a closed type using declarations from
+/// `signature`.
+pub fn check_in_signature(
+    term: &Term,
+    ty: &Term,
+    signature: &Signature,
+    config: EvalConfig,
+) -> Result<(), KernelError> {
+    let ctx = Context {
+        config,
+        signature: Some(signature),
         ..Context::default()
     };
     let expected = ctx.eval(ty)?;
@@ -787,6 +911,249 @@ mod tests {
         assert!(matches!(
             normalize(&app(pi(nat(), nat()), zero())),
             Err(KernelError::ExpectedFunction)
+        ));
+    }
+
+    #[test]
+    fn signature_validates_definitions_and_persists_prior_versions() {
+        let signature = Signature::default();
+        let checked = signature
+            .insert(Declaration::Definition(Definition::Transparent {
+                name: "one".into(),
+                ty: nat(),
+                body: succ(zero()),
+            }))
+            .unwrap();
+        assert!(signature.is_empty());
+        assert_eq!(checked.len(), 1);
+        assert!(matches!(
+            checked.get("one"),
+            Some(Declaration::Definition(_))
+        ));
+        assert!(matches!(
+            checked.insert(Declaration::Definition(Definition::Opaque {
+                name: "one".into(),
+                ty: nat(),
+            })),
+            Err(KernelError::DuplicateDeclaration(name)) if name == "one"
+        ));
+    }
+
+    #[test]
+    fn signature_rejects_ill_typed_definition_bodies_and_constructor_name_clashes() {
+        let signature = Signature::default();
+        assert!(matches!(
+            signature.insert(Declaration::Definition(Definition::Transparent {
+                name: "bad".into(),
+                ty: nat(),
+                body: universe(0),
+            })),
+            Err(KernelError::TypeMismatch { .. })
+        ));
+
+        let bool_decl = InductiveDecl {
+            name: "Bool".into(),
+            params: vec![],
+            indices: vec![],
+            universe: 0,
+            constructors: vec![
+                ConstructorDecl {
+                    name: "true".into(),
+                    fields: vec![],
+                    result_indices: vec![],
+                },
+                ConstructorDecl {
+                    name: "false".into(),
+                    fields: vec![],
+                    result_indices: vec![],
+                },
+            ],
+        };
+        let signature = signature.insert(Declaration::Inductive(bool_decl)).unwrap();
+        assert!(matches!(
+            signature.insert(Declaration::Definition(Definition::Opaque {
+                name: "true".into(),
+                ty: nat(),
+            })),
+            Err(KernelError::DuplicateDeclaration(name)) if name == "true"
+        ));
+    }
+
+    #[test]
+    fn signature_aware_evaluation_unfolds_transparent_and_preserves_opaque_globals() {
+        let signature = Signature::default()
+            .insert(Declaration::Definition(Definition::Transparent {
+                name: "one".into(),
+                ty: nat(),
+                body: succ(zero()),
+            }))
+            .unwrap()
+            .insert(Declaration::Definition(Definition::Opaque {
+                name: "external_nat".into(),
+                ty: nat(),
+            }))
+            .unwrap();
+
+        let one = eval_in_signature(&global("one"), &signature, EvalConfig::default()).unwrap();
+        assert_eq!(quote(&one, 0, EvalConfig::default()).unwrap(), succ(zero()));
+        assert_eq!(
+            infer_in_signature(&global("one"), &signature, EvalConfig::default()).unwrap(),
+            nat()
+        );
+        check_in_signature(
+            &global("external_nat"),
+            &nat(),
+            &signature,
+            EvalConfig::default(),
+        )
+        .unwrap();
+
+        let opaque =
+            eval_in_signature(&global("external_nat"), &signature, EvalConfig::default()).unwrap();
+        assert_eq!(
+            quote(&opaque, 0, EvalConfig::default()).unwrap(),
+            global("external_nat")
+        );
+        assert!(matches!(
+            eval(&global("missing"), EvalConfig::default()),
+            Err(KernelError::UnknownGlobal(name)) if name == "missing"
+        ));
+    }
+
+    #[test]
+    fn closed_inductive_types_and_constructor_spines_are_checked() {
+        let bool_decl = InductiveDecl {
+            name: "Bool".into(),
+            params: vec![],
+            indices: vec![],
+            universe: 0,
+            constructors: vec![
+                ConstructorDecl {
+                    name: "true".into(),
+                    fields: vec![],
+                    result_indices: vec![],
+                },
+                ConstructorDecl {
+                    name: "false".into(),
+                    fields: vec![],
+                    result_indices: vec![],
+                },
+            ],
+        };
+        let signature = Signature::default()
+            .insert(Declaration::Inductive(bool_decl))
+            .unwrap();
+        assert_eq!(
+            infer_in_signature(&global("Bool"), &signature, EvalConfig::default()).unwrap(),
+            universe(0)
+        );
+        assert_eq!(
+            infer_in_signature(&global("true"), &signature, EvalConfig::default()).unwrap(),
+            global("Bool")
+        );
+        check_in_signature(
+            &global("false"),
+            &global("Bool"),
+            &signature,
+            EvalConfig::default(),
+        )
+        .unwrap();
+
+        let boxed = InductiveDecl {
+            name: "BoxNat".into(),
+            params: vec![],
+            indices: vec![],
+            universe: 0,
+            constructors: vec![ConstructorDecl {
+                name: "box".into(),
+                fields: vec![Binder {
+                    name: "value".into(),
+                    ty: nat(),
+                }],
+                result_indices: vec![],
+            }],
+        };
+        let signature = signature.insert(Declaration::Inductive(boxed)).unwrap();
+        let value = app(global("box"), succ(zero()));
+        assert_eq!(
+            infer_in_signature(&value, &signature, EvalConfig::default()).unwrap(),
+            global("BoxNat")
+        );
+        assert_eq!(
+            normalize_in_signature(&value, &signature, EvalConfig::default()).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn signature_rejects_inductive_features_outside_the_implemented_fragment() {
+        let parameterized = InductiveDecl {
+            name: "List".into(),
+            params: vec![Binder {
+                name: "A".into(),
+                ty: universe(0),
+            }],
+            indices: vec![],
+            universe: 0,
+            constructors: vec![ConstructorDecl {
+                name: "nil".into(),
+                fields: vec![],
+                result_indices: vec![],
+            }],
+        };
+        assert!(matches!(
+            Signature::default().insert(Declaration::Inductive(parameterized)),
+            Err(KernelError::InvalidDeclaration(_))
+        ));
+    }
+
+    #[test]
+    fn inductive_admission_rejects_ambiguous_names_before_registry_insertion() {
+        let duplicate = InductiveDecl {
+            name: "Choice".into(),
+            params: vec![],
+            indices: vec![],
+            universe: 0,
+            constructors: vec![
+                ConstructorDecl {
+                    name: "pick".into(),
+                    fields: vec![],
+                    result_indices: vec![],
+                },
+                ConstructorDecl {
+                    name: "pick".into(),
+                    fields: vec![],
+                    result_indices: vec![],
+                },
+            ],
+        };
+        assert!(matches!(
+            Signature::default().insert(Declaration::Inductive(duplicate)),
+            Err(KernelError::InvalidInductive(
+                "constructor names must be distinct"
+            ))
+        ));
+    }
+
+    #[test]
+    fn strict_positivity_rejects_a_recursive_name_to_the_left_of_an_arrow() {
+        let bad = InductiveDecl {
+            name: "Bad".into(),
+            params: vec![],
+            indices: vec![],
+            universe: 0,
+            constructors: vec![ConstructorDecl {
+                name: "mk_bad".into(),
+                fields: vec![Binder {
+                    name: "consume".into(),
+                    ty: pi(global("Bad"), nat()),
+                }],
+                result_indices: vec![],
+            }],
+        };
+        assert!(matches!(
+            Signature::default().insert(Declaration::Inductive(bad)),
+            Err(KernelError::NonPositiveOccurrence(name)) if name == "Bad"
         ));
     }
 }

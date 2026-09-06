@@ -16,4 +16,9 @@ pub enum KernelError {
     /// A configured evaluator or quotation budget was exhausted.
     OutOfFuel,
     InvalidInductive(&'static str),
+    DuplicateDeclaration(String),
+    InvalidDeclaration(String),
+    UnknownGlobal(String),
+    UnsupportedGlobal(String),
+    NonPositiveOccurrence(String),
 }
